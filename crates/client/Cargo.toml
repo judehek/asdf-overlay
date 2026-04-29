@@ -40,6 +40,7 @@ features = [
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
     "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_Security_Authorization",
     "Win32_System_SystemServices",
     "Win32_System_SystemInformation",
@@ -49,6 +50,7 @@ features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
+    "Win32_UI_WindowsAndMessaging",
 ]
 
 [package.metadata.docs.rs]

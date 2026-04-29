@@ -34,7 +34,7 @@ use tokio::{
 use tracing::{debug, error, trace, warn};
 use windows::{
     Win32::{
-        Foundation::{GENERIC_READ, GENERIC_WRITE, HINSTANCE},
+        Foundation::{GENERIC_READ, GENERIC_WRITE, HINSTANCE, HMODULE, LPARAM, LRESULT, WPARAM},
         Security::{
             ACL, AllocateAndInitializeSid,
             Authorization::{
@@ -46,16 +46,34 @@ use windows::{
             SetSecurityDescriptorDacl,
         },
         System::{
+            LibraryLoader::{
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
+                GetModuleHandleExW,
+            },
             SystemServices::{
                 DLL_PROCESS_ATTACH, SECURITY_DESCRIPTOR_REVISION, SECURITY_WORLD_RID,
             },
             Threading::GetCurrentProcessId,
         },
+        UI::WindowsAndMessaging::{CallNextHookEx, HHOOK},
     },
-    core::{BOOL, PSTR},
+    core::{BOOL, PCWSTR, PSTR},
 };
 
 use crate::server::IpcServerConn;
+
+/// Exported hook procedure for anti-cheat friendly DLL injection via
+/// `SetWindowsHookEx(WH_GETMESSAGE, ...)`.
+///
+/// SetWindowsHookEx requires a valid exported function pointer in the DLL
+/// being loaded. The actual overlay initialization still happens in `DllMain`
+/// as a side effect of the load triggered by Windows' hook dispatcher. This
+/// proc itself is a pass-through that forwards to the next hook in the chain,
+/// as recommended by MSDN for `WH_GETMESSAGE`.
+#[unsafe(no_mangle)]
+pub extern "system" fn asdf_overlay_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe { CallNextHookEx(Some(HHOOK(core::ptr::null_mut())), code, wparam, lparam) }
+}
 
 /// IPC server main loop.
 #[tracing::instrument(skip(server))]
@@ -206,6 +224,30 @@ pub unsafe extern "system" fn DllMain(dll_module: HINSTANCE, fdw_reason: u32, _:
         return true;
     }
 
+    // Pin this DLL so it can never be unloaded from the host process.
+    //
+    // This is critical when the DLL was injected via SetWindowsHookEx: when
+    // the injector exits (or explicitly calls UnhookWindowsHookEx), Windows
+    // would otherwise unload our DLL from the target process, calling
+    // DllMain(DLL_PROCESS_DETACH). But our tokio runtime threads are still
+    // running inside our memory, and Detours patches in graphics APIs still
+    // redirect into our code. Freeing our module at that point leaves both
+    // pointing at unmapped memory, which reliably crashes the target on its
+    // next Present/EndScene call.
+    //
+    // Pinning is irrevocable for the lifetime of the host process. Our DLL
+    // stays loaded until the target itself exits, at which point the normal
+    // process teardown can tear us down along with everything else. The
+    // injector is free to exit/reconnect without collateral damage.
+    unsafe {
+        let mut pinned = HMODULE::default();
+        let _ = GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            PCWSTR(dll_module.0 as *const u16),
+            &mut pinned,
+        );
+    }
+
     // setup tracing first
     #[cfg(debug_assertions)]
     setup_tracing();
@@ -220,15 +262,14 @@ pub unsafe extern "system" fn DllMain(dll_module: HINSTANCE, fdw_reason: u32, _:
     let pid = unsafe { GetCurrentProcessId() };
     let module_handle = dll_module.0 as usize;
     // setup first ipc server
-    let server = match create_ipc_server(create_ipc_addr(pid, module_handle as u32), true) {
+    let server = match create_ipc_server(create_ipc_addr(pid), true) {
         Ok(server) => server,
         Err(err) => {
             error!("cannot open ipc server. err: {err:?}");
             return false;
         }
     };
-    let create_server =
-        move || create_ipc_server(create_ipc_addr(pid, module_handle as u32), false);
+    let create_server = move || create_ipc_server(create_ipc_addr(pid), false);
 
     thread::spawn(move || {
         // initialize overlay

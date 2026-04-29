@@ -27,7 +27,11 @@ tracing-subscriber = "0.3"
 
 [dependencies.windows]
 workspace = true
-features = ["Win32_Security", "Win32_System_Diagnostics_Debug"]
+features = [
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_UI_WindowsAndMessaging",
+]
 
 [dependencies.tracing]
 version = "0.1"

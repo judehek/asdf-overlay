@@ -6,12 +6,19 @@ use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::request::Request;
 
-/// Creates a unique IPC address for the given process ID and module handle.
-/// Because there can be multiple overlays in the same process, we need to distinguish with the module handle.
+/// Creates an IPC address for the given process ID.
 ///
-/// This function is used internally by `asdf-overlay-client` and `asdf-overlay-dll` crates to establish IPC communication.
-pub fn create_ipc_addr(pid: u32, module_handle: u32) -> String {
-    format!("\\\\.\\pipe\\asdf-overlay-{pid}-{module_handle}")
+/// This function is used internally by `asdf-overlay-client` and
+/// `asdf-overlay-dll` crates to establish IPC communication.
+///
+/// Note: an earlier version of this protocol also hashed in the DLL's
+/// `HMODULE` to support multiple distinct overlays inside the same target
+/// process. That was dropped because kernel anti-cheats (Vanguard) deny the
+/// `PROCESS_VM_READ` access needed for the client-side injector to discover
+/// the remote `HMODULE`. Only one overlay instance per target process is
+/// supported.
+pub fn create_ipc_addr(pid: u32) -> String {
+    format!("\\\\.\\pipe\\asdf-overlay-{pid}")
 }
 
 /// Describes a request sent from the client to the server.
