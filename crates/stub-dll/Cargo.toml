@@ -1,0 +1,23 @@
+[package]
+name = "asdf-overlay-stub-dll"
+description = "No-op stub DLL for isolating injection-path issues in asdf-overlay. Exports the same hook proc as the real DLL and does nothing in DllMain."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "asdf_overlay_stub"
+crate-type = ["cdylib"]
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[target.'cfg(target_env = "msvc")'.build-dependencies]
+static_vcruntime = "3"

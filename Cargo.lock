@@ -196,6 +196,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "asdf-overlay-stub-dll"
+version = "1.2.1"
+dependencies = [
+ "static_vcruntime",
+ "windows",
+]
+
+[[package]]
 name = "asdf-overlay-vulkan-layer"
 version = "1.2.1"
 dependencies = [
