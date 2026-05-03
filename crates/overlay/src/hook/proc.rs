@@ -13,7 +13,9 @@ use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
         UI::{
-            Input::KeyboardAndMouse::{GetCapture, MAPVK_VSC_TO_VK, MapVirtualKeyA},
+            Input::KeyboardAndMouse::{
+                GetCapture, MAPVK_VSC_TO_VK, MapVirtualKeyA, ReleaseCapture,
+            },
             WindowsAndMessaging::{
                 self as msg, CallWindowProcA, CallWindowProcW, GA_ROOT, GetAncestor, MSG,
                 PEEK_MESSAGE_REMOVE_TYPE, PM_REMOVE, TranslateMessage,
@@ -122,6 +124,7 @@ fn process_read_message<const UNICODE: bool>(
     // even if we filter the message to block SDL
     on_message_read(msg);
     if should_filter_message(msg) {
+        release_capture_if_we_hold_it_on_release(msg);
         unsafe {
             // Call TranslateMessage for char messages
             _ = TranslateMessage(msg);
@@ -175,10 +178,60 @@ fn process_peek_message(
     }
 
     if should_filter {
+        release_capture_if_we_hold_it_on_release(msg);
         msg.message = msg::WM_NULL;
     }
 
     true
+}
+
+/// When the queue filter swallows a `WM_*BUTTONUP`, the WndProc subclass
+/// never runs for that message, so its `ReleaseCapture()` side effect in
+/// `cursor_event` never fires. If the matching `WM_*BUTTONDOWN` was also
+/// filtered (cursor was over the overlay at press time), the subclass
+/// *did* run for that one and called `SetCapture(backend.id)`. The
+/// result: capture stays stuck on the backend window forever, and every
+/// subsequent mouse message gets dropped by the queue filter via
+/// `any_backend_in_hover_block`'s `cap_id == backend.id` branch -- the
+/// game becomes completely unable to receive mouse input until the
+/// process is restarted, even though the cursor is no longer over the
+/// overlay. Symptom reported: "click on the overlay, mouse gets stuck on
+/// the overlay, no clicks anywhere on the screen work".
+///
+/// Reproduce the WndProc's release side effect synchronously here so the
+/// stuck state never builds up in the first place. The host doesn't see
+/// the message (we still substitute `WM_NULL`); the consumer still sees
+/// the release event because `on_message_read` emitted it unconditionally
+/// before we reached this point.
+#[inline]
+fn release_capture_if_we_hold_it_on_release(msg: &MSG) {
+    if !is_mouse_release_message(msg.message) {
+        return;
+    }
+    let cap_id = unsafe { GetCapture() }.0 as u32;
+    if cap_id == 0 {
+        return;
+    }
+    for backend in Backends::iter() {
+        if backend.id == cap_id {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            crate::proc_diag::log(format_args!(
+                "filter: released stuck capture on id={} for filtered up msg={:#x}",
+                backend.id, msg.message
+            ));
+            return;
+        }
+    }
+}
+
+#[inline]
+fn is_mouse_release_message(message: u32) -> bool {
+    matches!(
+        message,
+        msg::WM_LBUTTONUP | msg::WM_RBUTTONUP | msg::WM_MBUTTONUP | msg::WM_XBUTTONUP
+    )
 }
 
 #[tracing::instrument]
