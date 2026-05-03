@@ -9,7 +9,7 @@ use windows::{
         UI::{
             Input::{
                 HRAWINPUT,
-                KeyboardAndMouse::{GetActiveWindow, GetCapture},
+                KeyboardAndMouse::GetActiveWindow,
                 RAW_INPUT_DATA_COMMAND_FLAGS, RAWINPUT, RAWINPUTHEADER, RID_HEADER, RID_INPUT,
             },
             WindowsAndMessaging::GetForegroundWindow,
@@ -175,11 +175,11 @@ fn active_hwnd_input_blocked() -> bool {
 /// Games that poll `GetAsyncKeyState(VK_LBUTTON)` (League of Legends does)
 /// would still see clicks, even though the wndproc never delivered them. To
 /// close that hole we also lie to the polling APIs whenever the cursor is
-/// over the overlay rect (or the overlay window has capture mid-drag).
+/// over the overlay rect.
 ///
 /// Returns true if **any** registered backend currently has
 /// `block_cursor_in_overlay` enabled AND the live cursor position falls
-/// inside its overlay rect (or it holds mouse capture mid-drag).
+/// inside its overlay rect.
 ///
 /// Implementation note: we resolve the cursor position via `GetCursorPos`
 /// + `ScreenToClient` on each backend's HWND rather than reading the
@@ -196,9 +196,18 @@ fn active_hwnd_input_blocked() -> bool {
 /// that poll input, and `GetForegroundWindow` returned an HWND for which
 /// `Backends::with_backend` resolved to `None` in League (probably a
 /// child render window). In practice this iterates a 1-element map.
+///
+/// Important: we deliberately do **not** use a `GetCapture() == backend.id`
+/// shortcut here. The backend id IS the game's own top-level HWND, so the
+/// game's normal use of `SetCapture` on its own window (Valorant does this
+/// for click-and-hold UI buttons, drags, etc.) makes that predicate true
+/// even though the overlay is uninvolved. Returning true in that case
+/// caused our raw-input hooks to zero out the buffer Valorant polls, which
+/// made the entire game unresponsive to mouse input -- even when the
+/// cursor was nowhere near the overlay. Cursor-position alone is the
+/// correct hit-test.
 #[inline]
 fn any_backend_in_hover_block() -> bool {
-    let cap_id = unsafe { GetCapture() }.0 as u32;
     let mut screen_pt = POINT::default();
     let cursor_ok = unsafe { GetCursorPos(&mut screen_pt) }.as_bool();
 
@@ -217,18 +226,9 @@ fn any_backend_in_hover_block() -> bool {
         }
         if once_log::check_and_set(&once_log::GATE_BCIO_TRUE) {
             crate::proc_diag::log(format_args!(
-                "gate: backend id={} bcio=true cap_id={cap_id:#x} cursor_ok={cursor_ok} (one-shot)",
+                "gate: backend id={} bcio=true cursor_ok={cursor_ok} (one-shot)",
                 backend.id
             ));
-        }
-        if cap_id != 0 && cap_id == backend.id {
-            if once_log::check_and_set(&once_log::GATE_CAP_MATCH) {
-                crate::proc_diag::log(format_args!(
-                    "gate: capture match id={} (one-shot)",
-                    backend.id
-                ));
-            }
-            return true;
         }
 
         if !cursor_ok {
@@ -307,7 +307,6 @@ mod once_log {
     pub static GATE_NO_BACKENDS: AtomicBool = AtomicBool::new(false);
     pub static GATE_BCIO_FALSE: AtomicBool = AtomicBool::new(false);
     pub static GATE_BCIO_TRUE: AtomicBool = AtomicBool::new(false);
-    pub static GATE_CAP_MATCH: AtomicBool = AtomicBool::new(false);
     pub static GATE_LAST_POS_NONE: AtomicBool = AtomicBool::new(false);
     pub static GATE_LAST_POS_OUT: AtomicBool = AtomicBool::new(false);
     pub static GATE_LAST_POS_IN: AtomicBool = AtomicBool::new(false);

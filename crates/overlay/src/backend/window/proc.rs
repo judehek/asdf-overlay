@@ -34,7 +34,7 @@ use windows::{
                     ImmGetConversionStatus, ImmReleaseContext,
                 },
                 KeyboardAndMouse::{
-                    GetCapture, GetDoubleClickTime, GetKeyboardLayout, ReleaseCapture, SetCapture,
+                    GetDoubleClickTime, GetKeyboardLayout, ReleaseCapture, SetCapture,
                     TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
                 },
             },
@@ -57,17 +57,20 @@ windows::core::link!("user32.dll" "system" fn ScreenToClient(hwnd: HWND, lppoint
 /// consumed (not passed to the game's original wndproc).
 ///
 /// * Always-on `BlockInput` → consume (legacy behavior).
-/// * Position-filtered `block_cursor_in_overlay`:
-///   * If the game window currently has mouse capture, we're mid-drag that
-///     started inside the overlay -- keep consuming so the drag completes
-///     cleanly even if the cursor wanders outside.
-///   * Otherwise, consume iff the cursor is inside the overlay rect.
+/// * Position-filtered `block_cursor_in_overlay` → consume iff the cursor
+///   is inside the overlay rect.
 /// * Otherwise → pass through.
+///
+/// We deliberately do NOT use a `GetCapture() == hwnd_id` shortcut: the
+/// game frequently calls `SetCapture` on its own window for unrelated
+/// input handling (e.g. UI button hold tracking in Valorant), and treating
+/// that as "we hold the drag" would consume cursor messages the game is
+/// expecting -- making the game unresponsive to its own input even though
+/// the cursor is nowhere near the overlay.
 #[inline]
 fn should_consume_cursor(proc: &WindowProcData, hwnd_id: u32, x: i16, y: i16) -> bool {
     let blocking = proc.input_blocking();
     let bcio = proc.block_cursor_in_overlay;
-    let cap = unsafe { GetCapture() }.0 as u32;
     let (ox, oy) = proc.position;
     let (sw, sh) = proc.surface_size;
     let in_overlay = proc.cursor_in_overlay(x, y);
@@ -75,13 +78,11 @@ fn should_consume_cursor(proc: &WindowProcData, hwnd_id: u32, x: i16, y: i16) ->
         true
     } else if !bcio {
         false
-    } else if cap == hwnd_id {
-        true
     } else {
         in_overlay
     };
     crate::proc_diag::log(format_args!(
-        "consume_cursor hwnd={hwnd_id} xy=({x},{y}) blocking={blocking} bcio={bcio} cap={cap} pos=({ox},{oy}) size=({sw},{sh}) in_overlay={in_overlay} -> {result}"
+        "consume_cursor hwnd={hwnd_id} xy=({x},{y}) blocking={blocking} bcio={bcio} pos=({ox},{oy}) size=({sw},{sh}) in_overlay={in_overlay} -> {result}"
     ));
     result
 }
@@ -91,15 +92,12 @@ fn should_consume_cursor(proc: &WindowProcData, hwnd_id: u32, x: i16, y: i16) ->
 /// isn't useful for hit-testing. We fall back to the last-known client
 /// position tracked in `cursor_state`.
 #[inline]
-fn wheel_should_consume(proc: &WindowProcData, hwnd_id: u32) -> bool {
+fn wheel_should_consume(proc: &WindowProcData, _hwnd_id: u32) -> bool {
     if proc.input_blocking() {
         return true;
     }
     if !proc.block_cursor_in_overlay {
         return false;
-    }
-    if unsafe { GetCapture() }.0 as u32 == hwnd_id {
-        return true;
     }
     match proc.last_cursor_client_pos() {
         Some((x, y)) => proc.cursor_in_overlay(x, y),
@@ -362,14 +360,13 @@ fn process_wnd_proc(
                 ));
             }
 
-            // Consume move events while the cursor is over the overlay (or
-            // while dragging after a press started inside it). Upstream
-            // didn't consume WM_MOUSEMOVE at all -- keep that behavior for
-            // the legacy BlockInput path, but apply the new rule when
-            // `block_cursor_in_overlay` is active.
-            if proc.block_cursor_in_overlay
-                && (unsafe { GetCapture() }.0 as u32 == backend.id || proc.cursor_in_overlay(x, y))
-            {
+            // Consume move events while the cursor is over the overlay.
+            // No `GetCapture() == backend.id` shortcut here: the game
+            // setting capture on its own window for unrelated reasons
+            // (Valorant does this for UI input) would make us swallow the
+            // game's own move events. Cursor position is the only correct
+            // hit-test.
+            if proc.block_cursor_in_overlay && proc.cursor_in_overlay(x, y) {
                 return Some(LRESULT(0));
             }
         }
@@ -455,29 +452,29 @@ fn process_wnd_proc(
         //
         // We apply the same hit-test as the legacy cursor consume:
         //   * Legacy full-block → consume unconditionally.
-        //   * `block_cursor_in_overlay` → consume while over the overlay rect,
-        //     or while the game window has mouse capture (mid-drag that
-        //     started over the overlay).
+        //   * `block_cursor_in_overlay` → consume while over the overlay rect.
         //   * Otherwise → pass through, so outside-overlay clicks behave
         //     exactly as they do without the overlay attached.
+        //
+        // No `GetCapture() == backend.id` branch: the game itself uses
+        // `SetCapture` on its own window for unrelated input, and matching
+        // on it would zero the raw input the game is trying to read.
         msg::WM_INPUT => {
             let proc = backend.proc.lock();
             let blocking = proc.input_blocking();
             let bcio = proc.block_cursor_in_overlay;
-            let (cap_ours, in_overlay) = if bcio && !blocking {
-                let cap_ours = unsafe { GetCapture() }.0 as u32 == backend.id;
-                let in_overlay = match proc.last_cursor_client_pos() {
+            let in_overlay = if bcio && !blocking {
+                match proc.last_cursor_client_pos() {
                     Some((x, y)) => proc.cursor_in_overlay(x, y),
                     None => false,
-                };
-                (cap_ours, in_overlay)
+                }
             } else {
-                (false, false)
+                false
             };
-            let consume = blocking || (bcio && (cap_ours || in_overlay));
+            let consume = blocking || (bcio && in_overlay);
             crate::proc_diag::log(format_args!(
-                "wm_input hwnd={} blocking={} bcio={} cap_ours={} in_overlay={} -> consume={}",
-                backend.id, blocking, bcio, cap_ours, in_overlay, consume
+                "wm_input hwnd={} blocking={} bcio={} in_overlay={} -> consume={}",
+                backend.id, blocking, bcio, in_overlay, consume
             ));
             if consume {
                 return Some(LRESULT(0));
