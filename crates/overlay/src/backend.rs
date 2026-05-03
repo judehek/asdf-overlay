@@ -190,22 +190,41 @@ impl WindowBackend {
     /// Invalidate layout and recompute position.
     pub fn invalidate_layout(&self) {
         let mut render = self.render.lock();
-        let position = self.layout.lock().calc(
-            render
-                .surface
-                .get()
-                .map(|surface| surface.size())
-                .unwrap_or((0, 0)),
-            render.window_size,
-        );
+        let surface_size = render
+            .surface
+            .get()
+            .map(|surface| surface.size())
+            .unwrap_or((0, 0));
+        let position = self.layout.lock().calc(surface_size, render.window_size);
 
-        self.proc.lock().position = position;
+        {
+            let mut proc = self.proc.lock();
+            proc.position = position;
+            // Mirror the surface size into the wndproc-side state so the
+            // cursor hit-test in `hooked_wnd_proc` can run without taking
+            // the render lock (which would invert lock order).
+            proc.surface_size = surface_size;
+        }
         render.position = position;
+        crate::proc_diag::log(format_args!(
+            "invalidate_layout: id={} pos=({},{}) surface=({},{})",
+            self.id, position.0, position.1, surface_size.0, surface_size.1
+        ));
     }
 
     /// Set which input events are being listened to.
     pub fn listen_input(&self, flags: ListenInputFlags) {
         self.proc.lock().listen_input = flags;
+    }
+
+    /// Turn on/off "block cursor events only while over the overlay" mode.
+    /// Orthogonal to `block_input`: no focus/IME/cursor-clip side-effects.
+    pub fn block_cursor_in_overlay(&self, enabled: bool) {
+        self.proc.lock().block_cursor_in_overlay = enabled;
+        crate::proc_diag::log(format_args!(
+            "block_cursor_in_overlay: id={} enabled={enabled}",
+            self.id
+        ));
     }
 
     /// Sets the cursor to be displayed while input is blocked.

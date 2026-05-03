@@ -20,29 +20,92 @@ use scopeguard::defer;
 use std::alloc;
 use tracing::trace;
 use utf16string::{LittleEndian, WStr, WString};
-use windows::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    Globalization::LCIDToLocaleName,
-    System::SystemServices::{LOCALE_NAME_MAX_LENGTH, SORT_DEFAULT},
-    UI::{
-        Controls::{self, HOVER_DEFAULT},
-        Input::{
-            Ime::{
-                self as ime, CANDIDATELIST, HIMC, IME_COMPOSITION_STRING, IME_CONVERSION_MODE,
-                ImmGetCandidateListW, ImmGetCompositionStringW, ImmGetContext,
-                ImmGetConversionStatus, ImmReleaseContext,
+use windows::{
+    Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+        Globalization::LCIDToLocaleName,
+        System::SystemServices::{LOCALE_NAME_MAX_LENGTH, SORT_DEFAULT},
+        UI::{
+            Controls::{self, HOVER_DEFAULT},
+            Input::{
+                Ime::{
+                    self as ime, CANDIDATELIST, HIMC, IME_COMPOSITION_STRING, IME_CONVERSION_MODE,
+                    ImmGetCandidateListW, ImmGetCompositionStringW, ImmGetContext,
+                    ImmGetConversionStatus, ImmReleaseContext,
+                },
+                KeyboardAndMouse::{
+                    GetCapture, GetDoubleClickTime, GetKeyboardLayout, ReleaseCapture, SetCapture,
+                    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+                },
             },
-            KeyboardAndMouse::{
-                GetDoubleClickTime, GetKeyboardLayout, ReleaseCapture, SetCapture, TME_LEAVE,
-                TRACKMOUSEEVENT, TrackMouseEvent,
+            WindowsAndMessaging::{
+                self as msg, CallWindowProcA, DefWindowProcA, GetMessageTime, SetCursor,
+                WM_NCDESTROY, XBUTTON1,
             },
-        },
-        WindowsAndMessaging::{
-            self as msg, CallWindowProcA, DefWindowProcA, GetMessageTime, SetCursor, WM_NCDESTROY,
-            XBUTTON1,
         },
     },
+    core::BOOL,
 };
+
+// `GetCursorPos` and `ScreenToClient` are linked manually so we don't
+// have to enable additional `windows` crate features. Only the bare
+// signatures are needed; the macro generates a thin extern wrapper.
+windows::core::link!("user32.dll" "system" fn GetCursorPos(lppoint: *mut POINT) -> BOOL);
+windows::core::link!("user32.dll" "system" fn ScreenToClient(hwnd: HWND, lppoint: *mut POINT) -> BOOL);
+
+/// Decide whether a cursor event at (x, y) in client coords should be
+/// consumed (not passed to the game's original wndproc).
+///
+/// * Always-on `BlockInput` → consume (legacy behavior).
+/// * Position-filtered `block_cursor_in_overlay`:
+///   * If the game window currently has mouse capture, we're mid-drag that
+///     started inside the overlay -- keep consuming so the drag completes
+///     cleanly even if the cursor wanders outside.
+///   * Otherwise, consume iff the cursor is inside the overlay rect.
+/// * Otherwise → pass through.
+#[inline]
+fn should_consume_cursor(proc: &WindowProcData, hwnd_id: u32, x: i16, y: i16) -> bool {
+    let blocking = proc.input_blocking();
+    let bcio = proc.block_cursor_in_overlay;
+    let cap = unsafe { GetCapture() }.0 as u32;
+    let (ox, oy) = proc.position;
+    let (sw, sh) = proc.surface_size;
+    let in_overlay = proc.cursor_in_overlay(x, y);
+    let result = if blocking {
+        true
+    } else if !bcio {
+        false
+    } else if cap == hwnd_id {
+        true
+    } else {
+        in_overlay
+    };
+    crate::proc_diag::log(format_args!(
+        "consume_cursor hwnd={hwnd_id} xy=({x},{y}) blocking={blocking} bcio={bcio} cap={cap} pos=({ox},{oy}) size=({sw},{sh}) in_overlay={in_overlay} -> {result}"
+    ));
+    result
+}
+
+/// Same decision as [`should_consume_cursor`] but for `WM_MOUSEWHEEL` /
+/// `WM_MOUSEHWHEEL`, whose lparam carries screen coords (not client) and so
+/// isn't useful for hit-testing. We fall back to the last-known client
+/// position tracked in `cursor_state`.
+#[inline]
+fn wheel_should_consume(proc: &WindowProcData, hwnd_id: u32) -> bool {
+    if proc.input_blocking() {
+        return true;
+    }
+    if !proc.block_cursor_in_overlay {
+        return false;
+    }
+    if unsafe { GetCapture() }.0 as u32 == hwnd_id {
+        return true;
+    }
+    match proc.last_cursor_client_pos() {
+        Some((x, y)) => proc.cursor_in_overlay(x, y),
+        None => false,
+    }
+}
 
 #[inline]
 fn process_wnd_proc(
@@ -78,10 +141,48 @@ fn process_wnd_proc(
                 area == 1
             } =>
         {
+            // Resolve `GetCursorPos` *before* taking `backend.proc.lock()`.
+            // Our hook `hooked_get_cursor_pos` calls
+            // `foreground_hwnd_input_blocked()`, which itself takes
+            // `backend.proc.lock()`. parking_lot's mutex is non-reentrant,
+            // so calling the detoured `GetCursorPos` from inside our own
+            // proc lock on the message-pump thread re-enters the same lock
+            // and permanently deadlocks the host's message loop -- League
+            // freezes (black screen + Windows "not responding"). Same bug
+            // we fixed previously in `should_filter_message`.
+            //
+            // `ScreenToClient` is NOT detoured, so it's safe inside the
+            // lock.
+            let mut cursor_screen = POINT::default();
+            let cursor_ok = unsafe { GetCursorPos(&mut cursor_screen) }.as_bool();
+
             let proc = backend.proc.lock();
             if proc.input_blocking() {
                 unsafe { SetCursor(proc.blocking_cursor.and_then(load_cursor)) };
                 return Some(LRESULT(1));
+            }
+            // Hover mode: when the cursor is over the overlay rect,
+            // override the game's cursor with our own. League sets a
+            // custom cursor in WM_SETCURSOR every frame and Windows
+            // draws it using the hardware cursor on top of any DComp
+            // visual, including our composed overlay surface. By
+            // claiming WM_SETCURSOR here we replace it with the overlay
+            // cursor (currently `proc.blocking_cursor`, defaulting to
+            // IDC_ARROW; later this will reflect WebView2's hovered
+            // cursor type via `SetBlockingCursor`).
+            //
+            // Hit-test on live `GetCursorPos` rather than the cached
+            // `cursor_state`, same as `should_filter_message` and
+            // `any_backend_in_hover_block`, because the cache is
+            // unreliable when the cursor sits over a child window.
+            if proc.block_cursor_in_overlay && cursor_ok {
+                let mut p = cursor_screen;
+                if unsafe { ScreenToClient(HWND(backend.id as _), &mut p) }.as_bool()
+                    && proc.cursor_in_overlay(p.x as i16, p.y as i16)
+                {
+                    unsafe { SetCursor(proc.blocking_cursor.and_then(load_cursor)) };
+                    return Some(LRESULT(1));
+                }
             }
         }
 
@@ -181,52 +282,76 @@ fn process_wnd_proc(
 
         Controls::WM_MOUSELEAVE => {
             let mut proc = backend.proc.lock();
-            if !proc.listening_cursor() {
-                return None;
-            }
-
+            // Always reset `cursor_state` so position-filtered hover gates
+            // (`wheel_should_consume`, hover-mode polling-API gate, ...)
+            // see Outside as soon as the cursor leaves the window. Event
+            // emission is still gated on `listening_cursor()`.
+            let was_listening = proc.listening_cursor();
             proc.cursor_state = CursorState::Outside;
-            OverlayEventSink::emit(cursor_input(
-                backend.id,
-                proc.position,
-                lparam,
-                CursorEvent::Leave,
-            ));
 
-            if proc.input_blocking() {
-                return Some(LRESULT(0));
+            if was_listening {
+                OverlayEventSink::emit(cursor_input(
+                    backend.id,
+                    proc.position,
+                    lparam,
+                    CursorEvent::Leave,
+                ));
+
+                if proc.input_blocking() {
+                    return Some(LRESULT(0));
+                }
             }
         }
 
         msg::WM_MOUSEMOVE => {
             let mut proc = backend.proc.lock();
+            let [x, y] = bytemuck::cast::<_, [i16; 2]>(lparam.0 as u32);
+
+            // Always keep `cursor_state` in sync. Without this the
+            // `Outside → Inside(x, y)` transition only fires when the
+            // client explicitly subscribed via `ListenInput` (or legacy
+            // `BlockInput` is on), so position-filtered consumers
+            // (`wheel_should_consume`, hover-mode polling-API gate)
+            // observe a stale `Outside` state in pure hover mode and
+            // fail to fire. Event emission is still gated on
+            // `listening_cursor()` so we don't change observable IPC.
+            let was_outside = matches!(proc.cursor_state, CursorState::Outside);
+            match proc.cursor_state {
+                CursorState::Inside(ref mut old_x, ref mut old_y) => {
+                    *old_x = x;
+                    *old_y = y;
+                }
+                CursorState::Outside => {
+                    proc.cursor_state = CursorState::Inside(x, y);
+                    crate::proc_diag::log(format_args!(
+                        "wm_mousemove Outside->Inside id={} x={} y={} (first transition this run will be visible)",
+                        backend.id, x, y
+                    ));
+                }
+            }
+
+            // `TrackMouseEvent` must be (re-)armed every Outside →
+            // Inside transition so we get the matching `WM_MOUSELEAVE`
+            // and reset state cleanly. Cheap and idempotent.
+            if was_outside {
+                _ = unsafe {
+                    TrackMouseEvent(&mut TRACKMOUSEEVENT {
+                        cbSize: mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: HWND(backend.id as _),
+                        dwHoverTime: HOVER_DEFAULT,
+                    })
+                };
+            }
+
             if proc.listening_cursor() {
-                let [x, y] = bytemuck::cast::<_, [i16; 2]>(lparam.0 as u32);
-
-                match proc.cursor_state {
-                    CursorState::Inside(ref mut old_x, ref mut old_y) => {
-                        *old_x = x;
-                        *old_y = y;
-                    }
-                    CursorState::Outside => {
-                        proc.cursor_state = CursorState::Inside(x, y);
-                        OverlayEventSink::emit(cursor_input(
-                            backend.id,
-                            proc.position,
-                            lparam,
-                            CursorEvent::Enter,
-                        ));
-
-                        // track for leave event
-                        _ = unsafe {
-                            TrackMouseEvent(&mut TRACKMOUSEEVENT {
-                                cbSize: mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                                dwFlags: TME_LEAVE,
-                                hwndTrack: HWND(backend.id as _),
-                                dwHoverTime: HOVER_DEFAULT,
-                            })
-                        };
-                    }
+                if was_outside {
+                    OverlayEventSink::emit(cursor_input(
+                        backend.id,
+                        proc.position,
+                        lparam,
+                        CursorEvent::Enter,
+                    ));
                 }
 
                 OverlayEventSink::emit(cursor_input(
@@ -235,6 +360,17 @@ fn process_wnd_proc(
                     lparam,
                     CursorEvent::Move,
                 ));
+            }
+
+            // Consume move events while the cursor is over the overlay (or
+            // while dragging after a press started inside it). Upstream
+            // didn't consume WM_MOUSEMOVE at all -- keep that behavior for
+            // the legacy BlockInput path, but apply the new rule when
+            // `block_cursor_in_overlay` is active.
+            if proc.block_cursor_in_overlay
+                && (unsafe { GetCapture() }.0 as u32 == backend.id || proc.cursor_in_overlay(x, y))
+            {
+                return Some(LRESULT(0));
             }
         }
 
@@ -255,7 +391,7 @@ fn process_wnd_proc(
                 },
             ));
 
-            if proc.input_blocking() {
+            if wheel_should_consume(&proc, backend.id) {
                 return Some(LRESULT(0));
             }
         }
@@ -277,7 +413,7 @@ fn process_wnd_proc(
                 },
             ));
 
-            if proc.input_blocking() {
+            if wheel_should_consume(&proc, backend.id) {
                 return Some(LRESULT(0));
             }
         }
@@ -305,6 +441,46 @@ fn process_wnd_proc(
             let proc = backend.proc.lock();
             if proc.input_blocking() {
                 return Some(unsafe { DefWindowProcA(HWND(backend.id as _), msg, wparam, lparam) });
+            }
+        }
+
+        // WM_INPUT (Raw Input) delivery. Modern games read mouse clicks via
+        // `RegisterRawInputDevices` + `GetRawInputData`, which bypasses the
+        // usual legacy `WM_?BUTTON*` messages. The game is notified about new
+        // raw-input records by `WM_INPUT` posted to its focused window. If
+        // we never chain that message into the original wndproc, the game's
+        // wndproc is never notified and never calls `GetRawInputData` for
+        // that sequence, so the event is effectively dropped for that app
+        // (the kernel's per-process input queue will age it out).
+        //
+        // We apply the same hit-test as the legacy cursor consume:
+        //   * Legacy full-block → consume unconditionally.
+        //   * `block_cursor_in_overlay` → consume while over the overlay rect,
+        //     or while the game window has mouse capture (mid-drag that
+        //     started over the overlay).
+        //   * Otherwise → pass through, so outside-overlay clicks behave
+        //     exactly as they do without the overlay attached.
+        msg::WM_INPUT => {
+            let proc = backend.proc.lock();
+            let blocking = proc.input_blocking();
+            let bcio = proc.block_cursor_in_overlay;
+            let (cap_ours, in_overlay) = if bcio && !blocking {
+                let cap_ours = unsafe { GetCapture() }.0 as u32 == backend.id;
+                let in_overlay = match proc.last_cursor_client_pos() {
+                    Some((x, y)) => proc.cursor_in_overlay(x, y),
+                    None => false,
+                };
+                (cap_ours, in_overlay)
+            } else {
+                (false, false)
+            };
+            let consume = blocking || (bcio && (cap_ours || in_overlay));
+            crate::proc_diag::log(format_args!(
+                "wm_input hwnd={} blocking={} bcio={} cap_ours={} in_overlay={} -> consume={}",
+                backend.id, blocking, bcio, cap_ours, in_overlay, consume
+            ));
+            if consume {
+                return Some(LRESULT(0));
             }
         }
 
@@ -564,7 +740,12 @@ fn cursor_event<const BLOCK_RESULT: isize>(
         CursorEvent::Action { action, state },
     ));
 
-    if proc.input_blocking() {
+    // lparam low/high words encode (x, y) in client coords for all
+    // WM_?BUTTON* messages. Use them for the position-based consume
+    // decision -- for the legacy `input_blocking` path the values don't
+    // matter since it consumes unconditionally.
+    let [x, y] = bytemuck::cast::<_, [i16; 2]>(lparam.0 as u32);
+    if should_consume_cursor(&proc, hwnd, x, y) {
         // prevent deadlock
         drop(proc);
         match state {

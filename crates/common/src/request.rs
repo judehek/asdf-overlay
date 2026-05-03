@@ -39,6 +39,10 @@ pub enum WindowRequest {
     /// Whether to block input events from reaching window and listen all input events.
     BlockInput(BlockInput),
 
+    /// Consume cursor events only while the cursor is inside the overlay
+    /// surface's bounds. See [`BlockCursorInOverlay`].
+    BlockCursorInOverlay(BlockCursorInOverlay),
+
     /// Set cursor of a window when being input blocked.
     SetBlockingCursor(SetBlockingCursor),
 
@@ -129,6 +133,24 @@ pub struct BlockInput {
     pub block: bool,
 }
 impl_WindowRequestItem!(BlockInput);
+
+#[derive(Debug, Default, Encode, Decode, Clone, PartialEq, Eq)]
+/// Consume cursor events while the cursor is inside the overlay surface's
+/// current bounds; pass through events outside.
+///
+/// Orthogonal to [`BlockInput`]: this does **not** steal focus, clip the
+/// cursor, or touch IME. Intended for overlays that should only be
+/// interactable over their visible area (goverlay-style hit-testing).
+///
+/// Once a cursor button is pressed while the cursor is over the overlay,
+/// the game window takes mouse capture, and subsequent cursor events
+/// continue to be consumed until the final button is released -- so
+/// drag-from-overlay-to-outside works as the user expects.
+pub struct BlockCursorInOverlay {
+    /// Whether the filtered blocking is active.
+    pub enabled: bool,
+}
+impl_WindowRequestItem!(BlockCursorInOverlay);
 
 #[derive(Debug, Default, Encode, Decode, Clone, PartialEq, Eq)]
 /// Set cursor of a window being input captured

@@ -1544,6 +1544,8 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "asdf-overlay-common",
+ "bincode",
  "camino",
  "cargo_metadata",
  "clap",

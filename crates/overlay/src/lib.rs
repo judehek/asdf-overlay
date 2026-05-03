@@ -48,6 +48,7 @@ pub mod surface;
 
 mod hook;
 mod interop;
+mod proc_diag;
 mod renderer;
 mod resources;
 mod texture;

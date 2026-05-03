@@ -11,9 +11,9 @@ use scopeguard::defer;
 use tracing::{debug, trace};
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
         UI::{
-            Input::KeyboardAndMouse::{MAPVK_VSC_TO_VK, MapVirtualKeyA},
+            Input::KeyboardAndMouse::{GetCapture, MAPVK_VSC_TO_VK, MapVirtualKeyA},
             WindowsAndMessaging::{
                 self as msg, CallWindowProcA, CallWindowProcW, GA_ROOT, GetAncestor, MSG,
                 PEEK_MESSAGE_REMOVE_TYPE, PM_REMOVE, TranslateMessage,
@@ -47,6 +47,9 @@ windows::core::link!("user32.dll" "system" fn PeekMessageW(
 ) -> BOOL);
 windows::core::link!("user32.dll" "system" fn DefWindowProcA(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT);
 windows::core::link!("user32.dll" "system" fn DefWindowProcW(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT);
+
+windows::core::link!("user32.dll" "system" fn GetCursorPos(lppoint: *mut POINT) -> BOOL);
+windows::core::link!("user32.dll" "system" fn ScreenToClient(hwnd: HWND, lppoint: *mut POINT) -> BOOL);
 
 struct Hook {
     get_message_a: DetourHook<GetMessageFn>,
@@ -462,6 +465,13 @@ const CURSOR_MESSAGES: &[u32] = &[
     msg::WM_XBUTTONDBLCLK,
     msg::WM_MOUSEWHEEL,
     msg::WM_MOUSEHWHEEL,
+    // Raw input. Games that call `RegisterRawInputDevices` with the
+    // `RIDEV_NOLEGACY` flag (League of Legends does for mouse) stop
+    // receiving `WM_LBUTTONDOWN` / `WM_LBUTTONUP` etc. entirely, and
+    // get clicks only as `WM_INPUT`. Treat raw-input messages as
+    // cursor messages so the queue filter can swallow them in hover
+    // mode the same way it swallows the legacy button messages.
+    msg::WM_INPUT,
 ];
 
 const KEYBOARD_MESSAGES: &[u32] = &[
@@ -483,14 +493,182 @@ fn is_keyboard_message(message: u32) -> bool {
     KEYBOARD_MESSAGES.contains(&message)
 }
 
-/// Filter input messages when blocking is enabled
+/// One-shot diagnostic flags for `should_filter_message`. Without these
+/// the queue filter is a silent black box -- when no `consume_cursor` log
+/// fires we can't tell if the filter ate the message or it just never
+/// arrived. Each flag fires exactly once per process so the proc_diag log
+/// stays small.
+mod filter_diag {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    pub static FILTER_NO_BACKEND: AtomicBool = AtomicBool::new(false);
+    pub static FILTER_INPUT_BLOCKING: AtomicBool = AtomicBool::new(false);
+    pub static FILTER_CAP_HELD: AtomicBool = AtomicBool::new(false);
+    pub static FILTER_NO_CURSOR_POS: AtomicBool = AtomicBool::new(false);
+    pub static FILTER_S2C_FAIL: AtomicBool = AtomicBool::new(false);
+    pub static FILTER_IN_OVERLAY: AtomicBool = AtomicBool::new(false);
+    pub static FILTER_OFF_OVERLAY: AtomicBool = AtomicBool::new(false);
+    pub static FILTER_INPUT_MSG_SEEN: AtomicBool = AtomicBool::new(false);
+
+    #[inline]
+    pub fn check_and_set(flag: &AtomicBool) -> bool {
+        !flag.swap(true, Ordering::Relaxed)
+    }
+}
+
+/// Filter input messages out of the application's message queue.
+///
+/// Two modes:
+///
+/// 1. **Legacy `BlockInput` (`input_blocking()` is true):** filter every
+///    cursor and keyboard message unconditionally.
+///
+/// 2. **Hover-mode `block_cursor_in_overlay`:** filter cursor messages
+///    when the cursor is over the overlay rect (or while we hold mouse
+///    capture mid-drag). This is needed because the wndproc subclass
+///    swallowing `WM_LBUTTONDOWN` by returning `LRESULT(0)` is too late
+///    if the host app peeks the message out of its queue and handles it
+///    inline before `DispatchMessage` reaches us. League of Legends does
+///    exactly this: it reads click messages from its own message loop,
+///    not just the wndproc.
+///
+///    Hit-testing uses live `GetCursorPos` + per-backend `ScreenToClient`
+///    rather than the wndproc-cached `cursor_state`, because the cache is
+///    unreliable when the cursor sits over a child window (the root
+///    wndproc receives `WM_MOUSELEAVE` and stops getting `WM_MOUSEMOVE`
+///    until the cursor returns to the root's own client area).
+///
+/// Important: we deliberately do **not** look the backend up via
+/// `msg.hwnd` here. League registers raw input devices on a separate
+/// hidden top-level window, so `WM_INPUT` is delivered to that hwnd
+/// rather than the render window we registered as a backend. The hwnd
+/// the message is addressed to is irrelevant for the hit-test -- what
+/// matters is whether the cursor is currently over an overlay rect, and
+/// that's resolved by `GetCursorPos` + `ScreenToClient` per backend.
+/// We iterate all registered backends and filter as soon as any of them
+/// wants the message dropped.
 #[inline]
 fn should_filter_message(msg: &MSG) -> bool {
-    if !is_cursor_message(msg.message) && !is_keyboard_message(msg.message) {
+    let is_cursor = is_cursor_message(msg.message);
+    let is_keyboard = is_keyboard_message(msg.message);
+    if !is_cursor && !is_keyboard {
         return false;
     }
 
-    with_root_backend(msg, |backend| backend.proc.lock().input_blocking()).unwrap_or(false)
+    // Confirm WM_INPUT messages actually flow through the queue filter.
+    // Logged once per process.
+    if msg.message == msg::WM_INPUT
+        && filter_diag::check_and_set(&filter_diag::FILTER_INPUT_MSG_SEEN)
+    {
+        crate::proc_diag::log(format_args!(
+            "filter: WM_INPUT seen in queue (one-shot) hwnd={:#x}",
+            msg.hwnd.0 as usize
+        ));
+    }
+
+    // Resolve the live cursor position *before* taking any
+    // `backend.proc` lock. `GetCursorPos` is detoured by `input.rs` and
+    // the detour itself reaches into `backend.proc.lock()` (via
+    // `foreground_hwnd_input_blocked`). Calling it from inside the same
+    // proc lock on the host's message-pump thread re-enters
+    // parking_lot's non-reentrant mutex and deadlocks the message loop,
+    // which freezes the entire game (black screen + Windows "not
+    // responding" kill). `ScreenToClient` is NOT detoured, so doing the
+    // coord transform inside the lock is fine.
+    let cursor_screen = if is_cursor {
+        let mut p = POINT::default();
+        if unsafe { GetCursorPos(&mut p) }.as_bool() {
+            Some(p)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let cap_id = unsafe { GetCapture() }.0 as u32;
+
+    let mut saw_backend = false;
+    for backend in Backends::iter() {
+        saw_backend = true;
+        let proc = backend.proc.lock();
+
+        if proc.input_blocking() {
+            if filter_diag::check_and_set(&filter_diag::FILTER_INPUT_BLOCKING) {
+                crate::proc_diag::log(format_args!(
+                    "filter: input_blocking id={} msg={:#x} -> drop (one-shot)",
+                    backend.id, msg.message
+                ));
+            }
+            return true;
+        }
+
+        if !is_cursor || !proc.block_cursor_in_overlay {
+            continue;
+        }
+
+        // Capture-held mid-drag: keep filtering even off-overlay so the
+        // drag completes cleanly inside the overlay.
+        if cap_id != 0 && cap_id == backend.id {
+            if filter_diag::check_and_set(&filter_diag::FILTER_CAP_HELD) {
+                crate::proc_diag::log(format_args!(
+                    "filter: capture held id={} msg={:#x} -> drop (one-shot)",
+                    backend.id, msg.message
+                ));
+            }
+            return true;
+        }
+
+        // Authoritative live hit-test. We can't rely on `msg.lParam`
+        // alone -- `WM_MOUSEWHEEL` / `WM_MOUSEHWHEEL` carry screen
+        // coords, `WM_INPUT` lParam is a HRAWINPUT handle (no coords at
+        // all), and the legacy WM_*BUTTON* messages carry client coords
+        // -- so just normalise on the pre-captured `GetCursorPos`
+        // result.
+        let Some(screen_pt) = cursor_screen else {
+            if filter_diag::check_and_set(&filter_diag::FILTER_NO_CURSOR_POS) {
+                crate::proc_diag::log(format_args!(
+                    "filter: id={} GetCursorPos failed (one-shot)",
+                    backend.id
+                ));
+            }
+            continue;
+        };
+        let mut p = screen_pt;
+        let hwnd = HWND(backend.id as _);
+        if !unsafe { ScreenToClient(hwnd, &mut p) }.as_bool() {
+            if filter_diag::check_and_set(&filter_diag::FILTER_S2C_FAIL) {
+                crate::proc_diag::log(format_args!(
+                    "filter: id={} ScreenToClient failed (one-shot)",
+                    backend.id
+                ));
+            }
+            continue;
+        }
+
+        if proc.cursor_in_overlay(p.x as i16, p.y as i16) {
+            if filter_diag::check_and_set(&filter_diag::FILTER_IN_OVERLAY) {
+                crate::proc_diag::log(format_args!(
+                    "filter: id={} msg={:#x} client=({},{}) in_overlay=true -> drop (one-shot)",
+                    backend.id, msg.message, p.x, p.y
+                ));
+            }
+            return true;
+        }
+        if filter_diag::check_and_set(&filter_diag::FILTER_OFF_OVERLAY) {
+            crate::proc_diag::log(format_args!(
+                "filter: id={} msg={:#x} client=({},{}) in_overlay=false -> pass (one-shot)",
+                backend.id, msg.message, p.x, p.y
+            ));
+        }
+    }
+
+    if !saw_backend && filter_diag::check_and_set(&filter_diag::FILTER_NO_BACKEND) {
+        crate::proc_diag::log(format_args!(
+            "filter: no backends registered, msg={:#x} -> pass (one-shot)",
+            msg.message
+        ));
+    }
+    false
 }
 
 #[inline]

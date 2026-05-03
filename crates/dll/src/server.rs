@@ -6,13 +6,25 @@ use asdf_overlay_common::{
     ipc::{ClientRequest, Frame, ServerResponse, ServerToClientPacket},
     request::Request,
 };
-use asdf_overlay_event::OverlayEvent;
+use asdf_overlay_event::{OverlayEvent, WindowEvent};
 use bincode::Encode;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadHalf, split},
     net::windows::named_pipe::NamedPipeServer,
     sync::mpsc::{UnboundedSender, unbounded_channel},
 };
+
+fn short_event_kind(event: &OverlayEvent) -> &'static str {
+    match event {
+        OverlayEvent::Window { event, .. } => match event {
+            WindowEvent::Added { .. } => "Window::Added",
+            WindowEvent::Resized { .. } => "Window::Resized",
+            WindowEvent::Input(_) => "Window::Input",
+            WindowEvent::InputBlockingEnded => "Window::InputBlockingEnded",
+            WindowEvent::Destroyed => "Window::Destroyed",
+        },
+    }
+}
 
 /// IPC server implementatation.
 pub struct IpcServerConn {
@@ -30,22 +42,57 @@ impl IpcServerConn {
         tokio::spawn({
             async move {
                 let mut buf = Vec::new();
-                while let Some(packet) = chan_rx.recv().await {
-                    bincode::encode_into_std_write(packet, &mut buf, bincode::config::standard())?;
-
-                    Frame {
-                        size: buf.len() as u32,
+                let mut n: u64 = 0;
+                let result: anyhow::Result<()> = async {
+                    while let Some(packet) = chan_rx.recv().await {
+                        n += 1;
+                        let kind = match &packet {
+                            ServerToClientPacket::Response(r) => {
+                                format!("Response(id={})", r.id)
+                            }
+                            ServerToClientPacket::Event(e) => {
+                                format!("Event({})", short_event_kind(e))
+                            }
+                        };
+                        if let Err(err) = bincode::encode_into_std_write(
+                            packet,
+                            &mut buf,
+                            bincode::config::standard(),
+                        ) {
+                            crate::diag::log(format!(
+                                "writer encode ERR n={n} kind={kind}: {err:#}"
+                            ));
+                            return Err(err.into());
+                        }
+                        let size = buf.len() as u32;
+                        if let Err(err) = (Frame { size }).write(&mut tx).await {
+                            crate::diag::log(format!(
+                                "writer frame-write ERR n={n} kind={kind} size={size}: {err:#}"
+                            ));
+                            return Err(err.into());
+                        }
+                        if let Err(err) = tx.write_all(&buf).await {
+                            crate::diag::log(format!(
+                                "writer body-write ERR n={n} kind={kind} size={size}: {err:#}"
+                            ));
+                            return Err(err.into());
+                        }
+                        if let Err(err) = tx.flush().await {
+                            crate::diag::log(format!(
+                                "writer flush ERR n={n} kind={kind}: {err:#}"
+                            ));
+                            return Err(err.into());
+                        }
+                        buf.clear();
                     }
-                    .write(&mut tx)
-                    .await?;
-                    tx.write_all(&buf).await?;
-
-                    tx.flush().await?;
-
-                    buf.clear();
+                    crate::diag::log(format!("writer loop ended after n={n} (channel closed)"));
+                    Ok(())
                 }
-
-                Ok::<_, anyhow::Error>(())
+                .await;
+                if let Err(err) = &result {
+                    crate::diag::log(format!("writer task EXIT after n={n} ERR: {err:#}"));
+                }
+                result
             }
         });
 
