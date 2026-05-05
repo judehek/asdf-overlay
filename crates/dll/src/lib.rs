@@ -8,7 +8,6 @@
 #[cfg(debug_assertions)]
 mod dbg;
 
-mod diag;
 mod server;
 
 extern crate asdf_overlay_vulkan_layer;
@@ -134,7 +133,6 @@ async fn run(server: NamedPipeServer) -> anyhow::Result<()> {
         Ok(res.unwrap_or(false))
     }
 
-    crate::diag::log("run: client connected");
     let mut conn = IpcServerConn::new(server).await?;
     let emitter = conn.create_emitter();
     {
@@ -158,7 +156,6 @@ async fn run(server: NamedPipeServer) -> anyhow::Result<()> {
     OverlayEventSink::set(move |event| _ = emitter.emit(event));
     defer!({
         debug!("cleanup start");
-        crate::diag::log("run: cleanup (client disconnected)");
         OverlayEventSink::clear();
         Backends::cleanup_backends();
     });
@@ -168,50 +165,19 @@ async fn run(server: NamedPipeServer) -> anyhow::Result<()> {
         match recv_result {
             Ok((req_id, req)) => {
                 trace!("recv id: {req_id} req: {req:?}");
-                let variant = match &req {
-                    Request::Window { request, .. } => match request {
-                        WindowRequest::SetPosition(_) => "SetPosition",
-                        WindowRequest::SetAnchor(_) => "SetAnchor",
-                        WindowRequest::SetMargin(_) => "SetMargin",
-                        WindowRequest::ListenInput(_) => "ListenInput",
-                        WindowRequest::BlockInput(_) => "BlockInput",
-                        WindowRequest::BlockCursorInOverlay(_) => "BlockCursorInOverlay",
-                        WindowRequest::SetBlockingCursor(_) => "SetBlockingCursor",
-                        WindowRequest::UpdateSharedHandle(_) => "UpdateSharedHandle",
-                    },
-                };
-                crate::diag::log(format!("recv id={req_id} variant={variant}"));
                 match req {
                     Request::Window { id, request } => {
-                        let handled = match handle_window_event(id, request) {
-                            Ok(v) => v,
-                            Err(err) => {
-                                crate::diag::log(format!(
-                                    "handle_window_event ERR id={req_id} variant={variant}: {err:#}"
-                                ));
-                                return Err(err);
-                            }
-                        };
-                        crate::diag::log(format!(
-                            "handled id={req_id} variant={variant} -> {handled}"
-                        ));
-                        if let Err(err) = conn.reply(req_id, handled) {
-                            crate::diag::log(format!(
-                                "reply ERR id={req_id} variant={variant}: {err:#}"
-                            ));
-                            return Err(err);
-                        }
-                        crate::diag::log(format!("reply ok id={req_id} variant={variant}"));
+                        let handled = handle_window_event(id, request)?;
+                        conn.reply(req_id, handled)?;
                     }
                 }
             }
             Err(err) => {
-                crate::diag::log(format!("recv ERR: {err:#}"));
+                warn!("recv error, ending client loop: {err:#}");
                 break;
             }
         }
     }
-    crate::diag::log("run: loop exit");
     Ok(())
 }
 
