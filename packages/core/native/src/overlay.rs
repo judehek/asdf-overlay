@@ -90,7 +90,10 @@ fn attach(mut cx: FunctionContext) -> JsResult<JsPromise> {
         .context("cannot inject to the process");
 
         deferred.settle_with(&channel, move |mut cx| match res {
-            Ok((ipc, event)) => Ok(cx.boxed(Overlay::new(ipc, event))),
+            // Third element is an Option<HookGuard> for the WindowsHook
+            // strategy. Default inject() uses RemoteThread which always
+            // returns None there; ignore it.
+            Ok((ipc, event, _hook)) => Ok(cx.boxed(Overlay::new(ipc, event))),
             Err(err) => cx.throw_error(format!("{err:?}")),
         });
     });
